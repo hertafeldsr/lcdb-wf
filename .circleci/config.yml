@@ -40,7 +40,7 @@ variables:
   # Run the setup script, which installs miniconda, sets up bioconda, and
   # installs the global env
   setup: &setup
-    run: 
+    run:
       name: Setup conda
       command: .circleci/setup.sh
   # --------------------------------------------------------------------------
@@ -49,7 +49,25 @@ variables:
     run:
       name: Download example data
       command: |
+        yum install -yy rsync
+        # container has a default python of 2.6, and we're using argparse, so
+        # we need to use the environment.
         source activate lcdb-wf-test
+
+        # Note that $DEPLOY is set in the "set-paths" step configured below.
+        python deploy.py --flavor full --dest $DEPLOY
+
+        # Separately copy over some test-specific files
+        cp workflows/chipseq/run_test.sh $DEPLOY/workflows/chipseq
+        cp workflows/rnaseq/run_test.sh $DEPLOY/workflows/rnaseq
+        cp workflows/colocalization/run_test.sh $DEPLOY/workflows/references
+        cp workflows/colocalization/run_test.sh $DEPLOY/workflows/colocalization
+        mkdir $DEPLOY/ci
+        cp ci/get-data.py $DEPLOY/ci
+        cp ci/preprocessor.py $DEPLOY/ci
+
+        # download example data
+        cd $DEPLOY
         python ci/get-data.py
 
   pytest-step: &pytest-step
@@ -59,20 +77,41 @@ variables:
         source activate lcdb-wf-test
         pytest --doctest-modules lib
 
+  rnaseq-dryrun: &rnaseq-dryrun
+      run:
+        name: dry run
+        command: |
+          cd $DEPLOY/workflows/rnaseq
+          source activate lcdb-wf-test
+          ./run_test.sh --use-conda -n
+
   chipseq-step: &chipseq-step
       run:
         name: chipseq workflow
         command: |
-          cd workflows/chipseq
+          cd $DEPLOY/workflows/chipseq
           source activate lcdb-wf-test
           ./run_test.sh --use-conda -j2 -k -p -r
           python chipseq_trackhub.py config/config.yaml config/hub_config.yaml
+
+  chipseq-regression-step: &chipseq-regression-step
+      run:
+        name: chipseq regression test workflow
+        command: |
+          ORIG=$(pwd)
+          cd $DEPLOY/workflows/chipseq
+          source activate lcdb-wf-test
+          ./run_test.sh --use-conda -j2 -k -p -r \
+            --configfile $ORIG/test/test_configs/test_chipseq_regression.yaml \
+            --config sampletable=$ORIG/test/test_configs/chipseq_one_run.tsv \
+            --config merged_bigwigs="{}" \
+            --until bed_to_bigbed
 
   references-step: &references-step
       run:
         name: references workflow
         command: |
-          cd workflows/references
+          cd $DEPLOY/workflows/references
           source activate lcdb-wf-test
           ./run_test.sh  --use-conda -j2 -k -p -r
 
@@ -80,7 +119,7 @@ variables:
       run:
         name: rnaseq workflow
         command: |
-          cd workflows/rnaseq
+          cd $DEPLOY/workflows/rnaseq
           source activate lcdb-wf-test
           ./run_test.sh --use-conda -j2 -k -p -r
           python rnaseq_trackhub.py config/config.yaml config/hub_config.yaml
@@ -89,36 +128,54 @@ variables:
       run:
         name: rnaseq star aligner
         command: |
+          ORIG=$(pwd)
+          cd $DEPLOY
           cp -r workflows/rnaseq workflows/rnaseq-star
           cd workflows/rnaseq-star
           source activate lcdb-wf-test
           ./run_test.sh --use-conda -k -p -r \
             --forcerun star \
-            --configfile ../../test/test_configs/star_override.yaml \
-            --config sampletable=../../test/test_configs/two_samples.tsv \
+            --configfile $ORIG/test/test_configs/star_override.yaml \
+            --config sampletable=$ORIG/test/test_configs/two_samples.tsv \
             --until star
 
   rnaseq-sra-step: &rnaseq-sra-step
       run:
         name: rnaseq download from SRA
         command: |
+          ORIG=$(pwd)
+          cd $DEPLOY
           cp -r workflows/rnaseq workflows/rnaseq-sra-test
           cd workflows/rnaseq-sra-test
           source activate lcdb-wf-test
 
           ./run_test.sh --use-conda -k -p -r --until cutadapt \
-            --configfile ../../test/test_configs/override.yaml \
-            --config sampletable=../../test/test_configs/test_sra_sampletable.tsv
+            --configfile $ORIG/test/test_configs/override.yaml \
+            --config sampletable=$ORIG/test/test_configs/test_sra_sampletable.tsv
 
           ./run_test.sh --use-conda -k -p -r --until cutadapt \
-            --configfile ../../test/test_configs/override.yaml \
-            --config sampletable=../../test/test_configs/test_sra_sampletable_SE_only.tsv
+            --configfile $ORIG/test/test_configs/override.yaml \
+            --config sampletable=$ORIG/test/test_configs/test_sra_sampletable_SE_only.tsv
+
+  rnaseq-pe-step: &rnaseq-pe-step
+      run:
+        name: rnaseq test PE
+        command: |
+          ORIG=$(pwd)
+          cd $DEPLOY
+          cp -r workflows/rnaseq workflows/rnaseq-pe-test
+          cd workflows/rnaseq-pe-test
+          source activate lcdb-wf-test
+
+          ./run_test.sh --use-conda -k -p -r --until multiqc \
+            --configfile $ORIG/test/test_configs/override.yaml \
+            --config sampletable=$ORIG/test/test_configs/test_pe_sampletable.tsv
 
   colocalization-step: &colocalization-step
       run:
         name: colocalization workflow
         command: |
-          cd workflows/colocalization
+          cd $DEPLOY/workflows/colocalization
           source activate lcdb-wf-test
           ./run_test.sh --use-conda -j2 -k -p -r
 
@@ -128,6 +185,7 @@ variables:
         name: Set path
         command: |
           echo 'export PATH=$PATH:/root/project/miniconda/bin' >> $BASH_ENV
+          echo 'export DEPLOY=/tmp/lcdb-wf-test' >> $BASH_ENV
           source $BASH_ENV
 jobs:
 
@@ -158,6 +216,24 @@ jobs:
       - *get-data
       - *chipseq-step
 
+  chipseq-regression:
+    <<: *defaults
+    steps:
+      - checkout
+      - *restore_cache
+      - *set-path
+      - *get-data
+      - *chipseq-regression-step
+
+  rnaseq-dryrun:
+    <<: *defaults
+    steps:
+      - checkout
+      - *restore_cache
+      - *set-path
+      - *get-data
+      - *rnaseq-dryrun
+
   rnaseq:
     <<: *defaults
     steps:
@@ -176,6 +252,24 @@ jobs:
       - *get-data
       - *rnaseq-star-step
 
+  rnaseq-sra:
+    <<: *defaults
+    steps:
+      - checkout
+      - *restore_cache
+      - *set-path
+      - *get-data
+      - *rnaseq-sra-step
+
+
+  rnaseq-pe:
+    <<: *defaults
+    steps:
+      - checkout
+      - *restore_cache
+      - *set-path
+      - *get-data
+      - *rnaseq-pe-step
 
   colocalization:
     <<: *defaults
@@ -198,9 +292,6 @@ jobs:
   build-docs:
     <<: *defaults
     steps:
-      - add_ssh_keys:
-          fingerprints:
-            - 99:b4:dd:2c:82:9a:27:07:ca:b4:eb:bf:9c:49:4a:72
       - checkout
       - *restore_cache
       - *set-path
@@ -213,16 +304,16 @@ jobs:
       - run:
           name: Install git
           command: yum install git -y
+      - add_ssh_keys:
+          fingerprints:
+            - 2d:0c:b4:27:44:cf:f4:50:cc:14:a4:2b:c2:3c:09:06
       - run:
           name: Build and upload docs
-          command: ci/build-docs.sh
+          command: source activate lcdb-wf-test && ci/build-docs.sh
 
   report-env:
     <<: *defaults
     steps:
-      - add_ssh_keys:
-          fingerprints:
-            - 99:b4:dd:2c:82:9a:27:07:ca:b4:eb:bf:9c:49:4a:72
       - checkout
       - *restore_cache
       - *set-path
@@ -247,10 +338,23 @@ workflows:
            branches:
              ignore:
                - master
+      - chipseq-regression:
+         requires:
+           - initial-setup
+           - pytest
+         filters:
+           branches:
+             ignore:
+               - master
+      - rnaseq-dryrun:
+         requires:
+           - initial-setup
+           - pytest
       - rnaseq:
           requires:
             - initial-setup
             - pytest
+            - rnaseq-dryrun
           filters:
             branches:
               ignore:
@@ -259,6 +363,25 @@ workflows:
           requires:
             - initial-setup
             - pytest
+            - rnaseq-dryrun
+          filters:
+            branches:
+              ignore:
+                - master
+      - rnaseq-sra:
+          requires:
+            - initial-setup
+            - pytest
+            - rnaseq-dryrun
+          filters:
+            branches:
+              ignore:
+                - master
+      - rnaseq-pe:
+          requires:
+            - initial-setup
+            - pytest
+            - rnaseq-dryrun
           filters:
             branches:
               ignore:
